@@ -1,16 +1,12 @@
-"""Work chain for computing the critical temperature based on an `EpwWorkChain`."""
-
-from scipy.interpolate import interp1d
+"""Work chain for computing carrier mobility with convergence control."""
 
 from aiida import orm
-from aiida.common import AttributeDict
-from aiida.engine import WorkChain, ToContext, while_, if_, append_
+from aiida.engine import WorkChain, while_, append_, calcfunction
 
 from aiida_quantumespresso.workflows.protocols.utils import ProtocolMixin
 
+from aiida_epw.tools.band_analysis import extract_band_edges_from_epw_prep
 from aiida_epw.workflows.base import EpwBaseWorkChain
-
-from aiida.engine import calcfunction
 
 
 @calcfunction
@@ -34,14 +30,35 @@ def split_list(list_node: orm.List) -> dict:
     return {f"el_{no}": orm.Float(el) for no, el in enumerate(list_node.get_list())}
 
 
+@calcfunction
+def create_mobility_output(
+    output_parameters: orm.Dict,
+    convergence_history: orm.List,
+    is_converged: orm.Bool,
+) -> orm.Dict:
+    """Create the carrier mobility output Dict with proper provenance.
+
+    This calcfunction is used to create the carrier_mobility output node,
+    ensuring proper data provenance in the workflow.
+    """
+    output_params = output_parameters.get_dict()
+    mobility_data = {
+        "mobility_iBTE": output_params.get("mobility_iBTE"),
+        "mobility_SERTA": output_params.get("mobility_SERTA"),
+        "convergence_history": convergence_history.get_list(),
+        "is_converged": is_converged.value,
+    }
+    return orm.Dict(mobility_data)
+
+
 class MobilityWorkChain(ProtocolMixin, WorkChain):
     """
     Workchain to compute carrier mobility by converging results with respect to EPW interpolation.
 
     This workchain runs a series of `EpwBaseWorkChain` calculations to converge the
     carrier mobility with respect to the fine k-point and q-point mesh density used for
-    electron-phonon interpolation. Once converged, it runs a final `EpwBaseWorkChain`
-    to obtain the final mobility values.
+    electron-phonon interpolation. It can reuse externally provided quadrupole data but
+    does not generate it internally.
     """
 
     @classmethod
@@ -56,58 +73,65 @@ class MobilityWorkChain(ProtocolMixin, WorkChain):
         spec.input(
             "parent_folder_epw", valid_type=(orm.RemoteData, orm.RemoteStashFolderData)
         )
+        spec.input(
+            "parent_epw_prep_pk",
+            valid_type=orm.Int,
+            required=False,
+            help="The PK of the EpwPrepWorkChain node to extract CBM/VBM information from.",
+        )
+        spec.input(
+            "carrier_type",
+            valid_type=orm.Str,
+            required=False,
+            help="Carrier type: 'ele' for electrons, 'hole' for holes.",
+        )
         spec.input("interpolation_distance", valid_type=(orm.Float, orm.List))
         spec.input("convergence_threshold", valid_type=orm.Float, required=False)
         spec.input(
-            "always_run_final", valid_type=orm.Bool, default=lambda: orm.Bool(False)
+            "kfpoints_factor",
+            valid_type=orm.Int,
+            default=lambda: orm.Int(1),
+            help="Factor to multiply q-point mesh to get fine k-point mesh.",
         )
+        # Optional pre-calculated quadrupole data.
         spec.input(
-            "quadruple_dir", valid_type=orm.Str, # orm.RemoteData, orm.RemoteStashFolderData)
-             required=False, 
-             help="Absolute path to the quadrupole.fmt file."
-            )
-        
-      #  spec.input(
-      #      "quadruple",
-      #      valid_type=orm.XyData,
-      #      required=False,
-      #      help="The contents of the `quadruple.mft` file for the e-ph interpolation.",
-      #  )
+            "quadrupole_data",
+            valid_type=(orm.Str, orm.RemoteData, orm.SinglefileData),
+            required=False,
+            help="Pre-calculated quadrupole data: path string, RemoteData, or SinglefileData.",
+        )
 
-      #  spec.expose_inputs(
-      #      EpwBaseWorkChain,
-      #      namespace="epw_interp",
-      #      exclude=(
-      #          "clean_workdir",
-      #          "parent_folder_ph",
-      #          "parent_folder_nscf",
-      #          "parent_folder_chk",
-      #          "qfpoints",
-      #          "kfpoints",
-      #      ),
-      #      namespace_options={
-      #          "help": "Inputs for the interpolation `EpwBaseWorkChain`s."
-      #      },
-      #  )
-
+        # Expose select EpwBaseWorkChain inputs under epw_mobility namespace
+        spec.input_namespace(
+            "epw_mobility",
+            help="Inputs for the carrier mobility EpwBaseWorkChain.",
+        )
         spec.expose_inputs(
             EpwBaseWorkChain,
             namespace="epw_mobility",
-            exclude=(
+            include=(
+                "code",
+                "structure",
+                "parent_folder_epw",
+                "parameters",
+                "qfpoints_distance",
+                "kfpoints_factor",
+                "options",
+                "settings",
+                "kpoints",
+                "qpoints",
+                "max_iterations",
                 "clean_workdir",
-                "parent_folder_ph",
-                "parent_folder_nscf",
-                "parent_folder_chk",
-
             ),
             namespace_options={
-                "help": "Inputs for the carrier mobility `EpwBaseWorkChain`."
+                "required": False,
+                "populate_defaults": False,
+                "help": "Inputs for the carrier mobility EpwBaseWorkChain.",
             },
         )
 
         spec.outline(
             cls.setup,
-            #cls.generate_reciprocal_points,
             while_(cls.should_run_conv_test)(
                 cls.run_conv,
                 cls.inspect_conv,
@@ -119,12 +143,6 @@ class MobilityWorkChain(ProtocolMixin, WorkChain):
             valid_type=orm.Dict,
             help="The `output_parameters` output node of the final EPW calculation.",
         )
-        #spec.output(
-        #    "carrier_mobility",
-        #    valid_type=orm.XyData,
-        #    help="The carrier mobility of both iBTE and SERTA calculations from EPW.",
-        #)
-
         spec.output(
             "carrier_mobility",
             valid_type=orm.Dict,
@@ -167,13 +185,23 @@ class MobilityWorkChain(ProtocolMixin, WorkChain):
         parent_epw,
         protocol=None,
         overrides=None,
-        scon_epw_code=None,
         parent_folder_epw=None,
+        structure=None,
+        quadrupole_data=None,
+        quadruple_dir=None,  # Backwards compatibility alias
         **kwargs,
     ):
         """Return a builder prepopulated with inputs selected according to the chosen protocol.
 
-        :TODO:
+        :param epw_code: the ``Code`` instance configured for the ``epw.x`` plugin.
+        :param parent_epw: a completed EpwPrepWorkChain, EpwCalculation, or EpwBaseWorkChain.
+        :param protocol: protocol to use, if not specified, the default will be used.
+        :param overrides: optional dictionary of inputs to override the defaults of the protocol.
+        :param parent_folder_epw: optional RemoteData/RemoteStashFolderData to use as parent.
+        :param structure: optional StructureData, if not provided will be inferred from parent_epw.
+        :param quadrupole_data: optional path (str) or RemoteData/SinglefileData for quadrupole.fmt.
+        :param quadruple_dir: alias for quadrupole_data for backwards compatibility.
+        :return: a process builder instance with all inputs defined ready for launch.
         """
         inputs = cls.get_protocol_inputs(protocol, overrides)
 
@@ -193,41 +221,71 @@ class MobilityWorkChain(ProtocolMixin, WorkChain):
             raise ValueError(f"Invalid parent_epw process: {parent_epw.process_label}")
 
         if parent_folder_epw is None:
-            if (
-                epw_source.inputs.epw.code.computer.hostname
-                != epw_code.computer.hostname
-            ):
+            # For EpwBaseWorkChain / EpwCalculation the code lives at
+            # ``epw_source.inputs.code``; the old path through
+            # ``epw_source.inputs.epw.code`` only works when epw_source is an
+            # EpwCalculation accessed via an ``epw`` namespace, which is not
+            # the case here.
+            source_computer = epw_source.inputs.code.computer.hostname
+            if source_computer != epw_code.computer.hostname:
                 raise ValueError(
                     "The `epw_code` must be configured on the same computer as that where the `parent_epw` was run."
                 )
             parent_folder_epw = parent_epw.outputs.epw_folder
-        else:
-            # TODO: Add check to make sure parent_folder_epw is on same computer as epw_code
-            pass
 
-        # for epw_namespace in ("epw_mobility","epw_interpo"):
+        # Determine structure – walk up the caller chain looking for
+        # ``inputs.structure``.  Works for any depth of nesting.
+        if structure is None:
+            node = epw_source
+            while node is not None:
+                if "structure" in node.inputs:
+                    structure = node.inputs.structure
+                    break
+                node = node.caller
+            if structure is None:
+                raise ValueError(
+                    "Could not determine the structure from the parent node chain. "
+                    "Please pass `structure` explicitly."
+                )
+
         epw_namespace = "epw_mobility"
-        if epw_namespace == "epw_mobility":
-            epw_inputs = inputs.get(epw_namespace, None)
+        epw_inputs = inputs.get(epw_namespace, None)
 
-            epw_builder = EpwBaseWorkChain.get_builder_from_protocol(
-                code=epw_code,
-                structure=epw_source.caller.caller.inputs.structure,
-                protocol=protocol,
-                overrides=epw_inputs,
-            )
+        epw_builder = EpwBaseWorkChain.get_builder_from_protocol(
+            code=epw_code,
+            structure=structure,
+            protocol=protocol,
+            overrides=epw_inputs,
+            protocol_filename="base_mob.yaml",
+        )
 
+        # Copy individual fields from the sub-builder into the
+        # ``epw_mobility`` namespace (assigning the builder object directly
+        # is rejected because the namespace expects Data nodes, not a
+        # ProcessBuilderNamespace).
+        epw_mob = builder.epw_mobility
+        epw_mob.code = epw_code
+        epw_mob.parameters = epw_builder.parameters
+        epw_mob.kpoints = epw_source.inputs.kpoints
+        epw_mob.qpoints = epw_source.inputs.qpoints
 
-            epw_builder.code = epw_code
+        # Forward optional / protocol-derived inputs
+        if "options" in epw_builder and epw_builder.options is not None:
+            epw_mob.options = epw_builder.options
+        if "max_iterations" in epw_builder and epw_builder.max_iterations is not None:
+            epw_mob.max_iterations = epw_builder.max_iterations
+        if "clean_workdir" in epw_builder and epw_builder.clean_workdir is not None:
+            epw_mob.clean_workdir = epw_builder.clean_workdir
+        if "kfpoints_factor" in epw_builder and epw_builder.kfpoints_factor is not None:
+            epw_mob.kfpoints_factor = epw_builder.kfpoints_factor
+        if (
+            "qfpoints_distance" in epw_builder
+            and epw_builder.qfpoints_distance is not None
+        ):
+            epw_mob.qfpoints_distance = epw_builder.qfpoints_distance
 
-            epw_builder.kpoints = epw_source.inputs.kpoints
-            epw_builder.qpoints = epw_source.inputs.qpoints
-            if epw_inputs and "settings" in epw_inputs:
-                epw_builder.settings = orm.Dict(epw_inputs["settings"])
-            # if "settings" in epw_inputs:
-            #     epw_builder.settings = orm.Dict(epw_inputs["settings"])
-
-            builder[epw_namespace] = epw_builder
+        if epw_inputs and "settings" in epw_inputs:
+            epw_mob.settings = orm.Dict(epw_inputs["settings"])
 
         if isinstance(inputs["interpolation_distance"], float):
             builder.interpolation_distance = orm.Float(inputs["interpolation_distance"])
@@ -235,220 +293,319 @@ class MobilityWorkChain(ProtocolMixin, WorkChain):
             builder.interpolation_distance = orm.List(inputs["interpolation_distance"])
 
         builder.convergence_threshold = orm.Float(inputs["convergence_threshold"])
-        builder.structure = epw_source.caller.caller.inputs.structure
+        builder.structure = structure
         builder.parent_folder_epw = parent_folder_epw
-        # builder.qpoints_distance = orm.Float(inputs["qpoints_distance"])
-        # builder.kpoints_distance_scf = orm.Float(inputs["kpoints_distance_scf"])
-        # builder.kpoints_factor_nscf = orm.Int(inputs["kpoints_factor_nscf"])
         builder.clean_workdir = orm.Bool(inputs["clean_workdir"])
+
+        # Extract kfpoints_factor from inputs (protocol merged with overrides)
+        if "kfpoints_factor" in inputs:
+            builder.kfpoints_factor = orm.Int(inputs["kfpoints_factor"])
+
+        # Handle quadrupole data (support both names for backwards compatibility)
+        quad_data = quadrupole_data or quadruple_dir
+        if quad_data is not None:
+            if isinstance(quad_data, str):
+                builder.quadrupole_data = orm.Str(quad_data)
+            else:
+                builder.quadrupole_data = quad_data
 
         return builder
 
-
-    def generate_reciprocal_points(self):
-        """Generate the qpoints and kpoints meshes for the `ph.x` and `pw.x` calculations."""
-
-        inputs = {
-            "structure": self.inputs.structure,
-            "distance": self.inputs.qpoints_distance,
-            "force_parity": self.inputs.get("kpoints_force_parity", orm.Bool(False)),
-            "metadata": {"call_link_label": "create_qpoints_from_distance"},
-        }
-        qpoints = create_kpoints_from_distance(**inputs)  # pylint: disable=unexpected-keyword-arg
-        inputs = {
-            "structure": self.inputs.structure,
-            "distance": self.inputs.kpoints_distance_scf,
-            "force_parity": self.inputs.get("kpoints_force_parity", orm.Bool(False)),
-            "metadata": {"call_link_label": "create_kpoints_scf_from_distance"},
-        }
-        kpoints_scf = create_kpoints_from_distance(**inputs)
-
-        qpoints_mesh = qpoints.get_kpoints_mesh()[0]
-        kpoints_nscf = orm.KpointsData()
-        kpoints_nscf.set_kpoints_mesh(
-            [v * self.inputs.kpoints_factor_nscf.value for v in qpoints_mesh]
-        )
-
-        self.ctx.qpoints = qpoints
-        self.ctx.kpoints_scf = kpoints_scf
-        self.ctx.kpoints_nscf = kpoints_nscf
-
+    @staticmethod
+    def _get_quadrupole_input(quadrupole_data):
+        """Return the `EpwBaseWorkChain` input name/value for quadrupole data."""
+        if isinstance(quadrupole_data, orm.SinglefileData):
+            return "quadrupole_file", quadrupole_data
+        return "quadrupole_dir", quadrupole_data
 
     def setup(self):
         """Setup steps, i.e. initialise context variables."""
+        self.report("Starting setup")
         intp = self.inputs.get("interpolation_distance")
         if isinstance(intp, orm.List):
             self.ctx.interpolation_list = list(split_list(intp).values())
         else:
             self.ctx.interpolation_list = [intp]
 
-        self.ctx.interpolation_list.sort()
+        # Sort in descending order (start with coarse mesh, go to fine)
+        self.ctx.interpolation_list.sort(reverse=True)
         self.ctx.iteration = 0
         self.ctx.final_interp = None
         self.ctx.mobility_values = []
         self.ctx.is_converged = False
         self.ctx.degaussq = None
+        self.ctx.quadrupole_dir = None
+        self.ctx.quadrupole_file = None
+        self.ctx.epw_interp = []
+
+        if "quadrupole_data" in self.inputs:
+            key, value = self._get_quadrupole_input(self.inputs.quadrupole_data)
+            if key == "quadrupole_file":
+                self.ctx.quadrupole_file = value
+            else:
+                self.ctx.quadrupole_dir = value
+            self.report(f"Using pre-calculated quadrupole data as `{key}`.")
+
+        # Extract band edges and set fermi energy if parent_epw_prep_pk and carrier_type are provided
+        self.ctx.fermi_energy_override = None
+        if "parent_epw_prep_pk" in self.inputs and "carrier_type" in self.inputs:
+            try:
+                prep_pk = self.inputs.parent_epw_prep_pk.value
+                prep_wc = orm.load_node(prep_pk)
+                self.report(f"Loaded EpwPrepWorkChain <{prep_pk}>")
+
+                # Extract band edges from EpwPrepWorkChain
+                self.report("Attempting to extract band edges from NSCF data")
+                band_edges_dict = extract_band_edges_from_epw_prep(prep_wc)
+                if band_edges_dict and "method" in band_edges_dict:
+                    vbm_log = band_edges_dict.get("vbm")
+                    cbm_log = band_edges_dict.get("cbm")
+                    gap_log = band_edges_dict.get("bandgap")
+                    vbm_str = f"{vbm_log:.6f}" if vbm_log is not None else "None"
+                    cbm_str = f"{cbm_log:.6f}" if cbm_log is not None else "None"
+                    gap_str = f"{gap_log:.6f}" if gap_log is not None else "None"
+                    self.report(
+                        f"Band edges from {band_edges_dict['method']}: "
+                        f"VBM={vbm_str} eV, "
+                        f"CBM={cbm_str} eV, "
+                        f"gap={gap_str} eV"
+                    )
+
+                if band_edges_dict:  # Check if band edges were successfully extracted
+                    if "warning" in band_edges_dict:
+                        self.report(f"WARNING: {band_edges_dict['warning']}")
+
+                    carrier_type = self.inputs.carrier_type.value.lower()
+
+                    vbm = band_edges_dict.get("vbm")
+                    cbm = band_edges_dict.get("cbm")
+
+                    if carrier_type == "ele":
+                        # For electrons, set fermi energy slightly above CBM
+                        if cbm is not None:
+                            self.ctx.fermi_energy_override = cbm - 0.1
+                        else:
+                            self.report(
+                                "Warning: CBM is unavailable from band-edge extraction. "
+                                "Cannot set electron fermi_energy override."
+                            )
+                    elif carrier_type == "hole":
+                        # For holes, set fermi energy slightly below VBM
+                        if vbm is not None:
+                            self.ctx.fermi_energy_override = vbm + 0.1
+                        else:
+                            self.report(
+                                "Warning: VBM is unavailable from band-edge extraction. "
+                                "Cannot set hole fermi_energy override."
+                            )
+                    elif vbm is not None and cbm is not None:
+                        # Unknown carrier type, use mid-gap if both edges are available
+                        self.ctx.fermi_energy_override = (vbm + cbm) / 2.0
+                    else:
+                        self.report(
+                            "Warning: Incomplete band-edge data (missing VBM/CBM). "
+                            "Cannot set fermi_energy override."
+                        )
+
+                    if self.ctx.fermi_energy_override is not None:
+                        cbm_str = f"{cbm:.6f}" if cbm is not None else "None"
+                        vbm_str = f"{vbm:.6f}" if vbm is not None else "None"
+                        self.report(
+                            f"Set fermi_energy to {self.ctx.fermi_energy_override:.6f} eV "
+                            f"for carrier type '{carrier_type}' "
+                            f"(CBM={cbm_str} eV, VBM={vbm_str} eV, "
+                            f"method={band_edges_dict.get('method', 'unknown')})"
+                        )
+                else:
+                    self.report(
+                        "Warning: Could not extract band edges from parent_epw_prep. "
+                        "Using default fermi_energy from protocol."
+                    )
+            except Exception as e:
+                import traceback
+
+                self.report(
+                    f"Warning: Error extracting band edges: {e}. "
+                    f"Traceback: {traceback.format_exc()}"
+                    "Using default fermi_energy from protocol."
+                )
 
     def should_run_conv_test(self):
-        """Return True if there are still distances left in the list to test."""
-        # 只要列表不为空，就返回 True，继续进入 run_conv
+        """Return True if there are still distances left in the list to test and not converged."""
+        if self.ctx.is_converged:
+            return False
         return len(self.ctx.interpolation_list) > 0
 
-
-    def should_run_conv(self):
-        """Check if the convergence loop should continue or not."""
-        if "convergence_threshold" in self.inputs:
-            try:
-                # Need at least 2 runs to check for convergence
-                if len(self.ctx.epw_interp) < 2:
-                    return True
-
-                prev_mobility = self.ctx.epw_interp[-2].outputs.output_parameters.get_dict().get("mobility_iBTE")
-                new_mobility = self.ctx.epw_interp[-1].outputs.output_parameters.get_dict().get("mobility_iBTE")
-
-                if prev_mobility is None or new_mobility is None:
-                    self.report("Could not retrieve mobility from one of the previous calculations.")
-                    return True # Continue running, maybe it will appear in the next one
-
-                # Check for convergence, assuming mobility is a dictionary with values to compare.
-                # This part might need adjustment depending on the exact structure of `mobility_iBTE`.
-                # For simplicity, let's assume it's a single value for now.
-                is_converged = abs(prev_mobility - new_mobility) < self.inputs.convergence_threshold.value
-                self.ctx.is_converged = is_converged
-                self.report(f"Checking convergence: old={prev_mobility:.4f}, new={new_mobility:.4f} -> Converged: {is_converged}")
-
-            except (AttributeError, IndexError, KeyError) as e:
-                self.report(f"Not enough data to check convergence, continuing. Error: {e}")
-
-            if not self.ctx.is_converged and not self.ctx.interpolation_list:
-                 # Ran out of distances to try
-                if self.inputs.always_run_final:
-                    self.report("Mobility not converged, but running final calculation as requested.")
-                else:
-                    return self.exit_codes.ERROR_MOBILITY_NOT_CONVERGED
-
-        else:
-            self.report("No `convergence_threshold` input provided, convergence is assumed.")
-            self.ctx.is_converged = True
-
-        return not self.ctx.is_converged and self.ctx.interpolation_list
-
-
     def run_conv(self):
-        """Run the EpwBaseWorkChain in interpolation mode for the current interpolation distance."""
+        """Run the EpwBaseWorkChain for the current interpolation distance."""
         self.ctx.iteration += 1
 
-        inputs = AttributeDict(self.exposed_inputs(EpwBaseWorkChain, namespace="epw_mobility"))
-        inputs.parent_folder_epw = self.inputs.parent_folder_epw
-        inputs.qfpoints_distance = self.ctx.interpolation_list.pop(0) # Take the smallest distance first
+        # Manually construct inputs to EpwBaseWorkChain to avoid exposing unwanted inputs
+        parameters = self.inputs.epw_mobility.parameters.get_dict()
 
-    # === 处理 Quadrupole 文件的软链接 (ln -s) ===
-        # 假设你的 WorkChain 输入里有名为 'quadruple_dir' 的 Str 类型的绝对路径
-        if 'quadruple_dir' in self.inputs:
-            source_path = self.inputs.quadruple_dir.value
-            
-            # 获取 EPW 计算所用的计算机 UUID
-            # 注意：EpwBaseWorkChain 通常把计算的 inputs 放在 'epw' 命名空间下
-            # 确保 inputs.epw.code 存在。如果你的 structure 不一样，请调整这里获取 computer 的方式
-            computer = inputs.epw.code.computer
-            
-            # 准备 symlink 配置: [(uuid, 远程绝对路径, 目标文件名)]
-            symlink_item = (computer.uuid, source_path, 'quadrupole.fmt')
-            
-            # 确保字典路径存在，然后赋值
-            if 'metadata' not in inputs.epw:
-                inputs.epw.metadata = {}
-            if 'options' not in inputs.epw.metadata:
-                inputs.epw.metadata.options = {}
-                
-            # 设置 remote_symlink_list
-            # 这会让 AiiDA 在计算开始前执行 ln -s /path/to/quadrupole.fmt ./quadrupole.fmt
-            inputs.epw.metadata.options['remote_symlink_list'] = [symlink_item]
-        # ===============================================
+        inputs = {
+            "code": self.inputs.epw_mobility.code,
+            "structure": self.inputs.structure,
+            "parent_folder_epw": self.inputs.parent_folder_epw,
+            "qfpoints_distance": self.ctx.interpolation_list.pop(0),
+            "kfpoints_factor": self.inputs.kfpoints_factor,
+            "parameters": orm.Dict(parameters),
+        }
 
-        if 'kfpoints_factor' in self.inputs:
-            inputs.kfpoints_factor = self.inputs.kfpoints_factor
-        # 选项 B: 或者是硬编码一个默认值 (比如 1.0 表示和粗网格一样，或者更高的倍数)
-        else:
-            inputs.kfpoints_factor = int(1.0)
+        # Forward options (required by EpwBaseWorkChain)
+        if "options" in self.inputs.epw_mobility:
+            inputs["options"] = self.inputs.epw_mobility.options
 
+        # Forward optional inputs from epw_mobility namespace
+        if "settings" in self.inputs.epw_mobility:
+            inputs["settings"] = self.inputs.epw_mobility.settings
+        if "kpoints" in self.inputs.epw_mobility:
+            inputs["kpoints"] = self.inputs.epw_mobility.kpoints
+        if "qpoints" in self.inputs.epw_mobility:
+            inputs["qpoints"] = self.inputs.epw_mobility.qpoints
+        if "max_iterations" in self.inputs.epw_mobility:
+            inputs["max_iterations"] = self.inputs.epw_mobility.max_iterations
+        if "clean_workdir" in self.inputs.epw_mobility:
+            inputs["clean_workdir"] = self.inputs.epw_mobility.clean_workdir
 
-        if self.ctx.degaussq:
-            parameters = inputs.parameters.get_dict()
-            parameters.setdefault("INPUTEPW", {})["degaussq"] = self.ctx.degaussq
-            inputs.parameters = orm.Dict(parameters)
+        if self.ctx.quadrupole_dir is not None:
+            inputs["quadrupole_dir"] = self.ctx.quadrupole_dir
+        elif self.ctx.quadrupole_file is not None:
+            inputs["quadrupole_file"] = self.ctx.quadrupole_file
 
-        inputs.metadata.call_link_label = f"conv_{self.ctx.iteration:02d}"
+        # Override fermi_energy if it was set from band edges
+        if self.ctx.fermi_energy_override is not None:
+            parameters = inputs["parameters"].get_dict()
+            parameters.setdefault("INPUTEPW", {})["fermi_energy"] = (
+                self.ctx.fermi_energy_override
+            )
+            parameters.setdefault("INPUTEPW", {})["efermi_read"] = True
+            inputs["parameters"] = orm.Dict(parameters)
+            self.report(
+                f"Using fermi_energy override: {self.ctx.fermi_energy_override:.6f} eV"
+            )
+
+        # Override ncarrier sign based on carrier_type
+        if "carrier_type" in self.inputs:
+            carrier_type = self.inputs.carrier_type.value.lower()
+            parameters = inputs["parameters"].get_dict()
+            ncarrier = parameters.get("INPUTEPW", {}).get("ncarrier", 1.0e13)
+            if carrier_type == "hole":
+                ncarrier = -abs(ncarrier)
+                self.report(f"Setting ncarrier to negative for hole: {ncarrier:.2e}")
+            elif carrier_type == "ele":
+                ncarrier = abs(ncarrier)
+                self.report(
+                    f"Setting ncarrier to positive for electron: {ncarrier:.2e}"
+                )
+            parameters.setdefault("INPUTEPW", {})["ncarrier"] = ncarrier
+            inputs["parameters"] = orm.Dict(parameters)
+
+        # Safety: remove any None values from INPUTEPW to prevent
+        # ``conv_to_fortran`` from crashing on NoneType.
+        params_dict = inputs["parameters"].get_dict()
+        inputepw = params_dict.get("INPUTEPW", {})
+        none_keys = [k for k, v in inputepw.items() if v is None]
+        if none_keys:
+            for k in none_keys:
+                del inputepw[k]
+            self.report(f"Removed None-valued keys from INPUTEPW: {none_keys}")
+            # If fermi_energy was removed, also disable efermi_read
+            if "fermi_energy" in none_keys:
+                inputepw.pop("efermi_read", None)
+                self.report("Warning: fermi_energy is not set. Disabled efermi_read.")
+            params_dict["INPUTEPW"] = inputepw
+            inputs["parameters"] = orm.Dict(params_dict)
+
+        # Add metadata with call_link_label
+        inputs["metadata"] = {"call_link_label": f"conv_{self.ctx.iteration:02d}"}
+
         running = self.submit(EpwBaseWorkChain, **inputs)
-        self.report(f"Launched EpwBaseWorkChain<{running.pk}> for convergence run #{self.ctx.iteration}")
+        self.report(
+            f"Launched EpwBaseWorkChain<{running.pk}> for convergence run #{self.ctx.iteration}"
+        )
 
-        return ToContext(epw_interp=append_(running))
+        return {"epw_interp": append_(running)}
 
     def inspect_conv(self):
-        """Verify that the EpwBaseWorkChain in interpolation mode finished successfully."""
+        """Verify that the EpwBaseWorkChain finished successfully and check convergence."""
         workchain = self.ctx.epw_interp[-1]
 
         if not workchain.is_finished_ok:
-            self.report(f"Convergence EpwBaseWorkChain<{workchain.pk}> failed with exit status {workchain.exit_status}")
+            self.report(
+                f"Convergence EpwBaseWorkChain<{workchain.pk}> failed with exit status {workchain.exit_status}"
+            )
             return self.exit_codes.ERROR_SUB_PROCESS_EPW_INTERP
 
         try:
-            mobility = workchain.outputs.output_parameters.get_dict().get("mobility_iBTE", "N/A")
-            self.report(f"Convergence run #{self.ctx.iteration} finished with mobility: {mobility}")
+            output_params = workchain.outputs.output_parameters.get_dict()
+            mobility = output_params.get("mobility_iBTE", None)
+            self.report(
+                f"Convergence run #{self.ctx.iteration} finished with mobility: {mobility}"
+            )
             self.ctx.mobility_values.append(mobility)
 
             # Set degaussq from the first successful run if not already set
-            if self.ctx.degaussq is None and 'a2f' in workchain.outputs:
+            if self.ctx.degaussq is None and "a2f" in workchain.outputs:
                 frequency = workchain.outputs.a2f.get_array("frequency")
                 self.ctx.degaussq = frequency[-1] / 100
                 self.report(f"Set degaussq for subsequent runs to {self.ctx.degaussq}")
 
+            # Check convergence using relative difference
+            if (
+                "convergence_threshold" in self.inputs
+                and len(self.ctx.mobility_values) >= 2
+            ):
+                prev_mobility = self.ctx.mobility_values[-2]
+                new_mobility = self.ctx.mobility_values[-1]
+
+                if (
+                    prev_mobility is not None
+                    and new_mobility is not None
+                    and prev_mobility != 0
+                ):
+                    relative_diff = abs((new_mobility - prev_mobility) / prev_mobility)
+                    is_converged = (
+                        relative_diff < self.inputs.convergence_threshold.value
+                    )
+                    self.ctx.is_converged = is_converged
+                    self.report(
+                        f"Convergence check: old={prev_mobility:.4f}, new={new_mobility:.4f}, "
+                        f"relative_diff={relative_diff:.6f} -> Converged: {is_converged}"
+                    )
+                else:
+                    self.report(
+                        "Could not compute relative difference for convergence check."
+                    )
+
         except KeyError:
-            self.report("Could not find 'mobility_iBTE' in the output parameters of the convergence run.")
+            self.report(
+                "Could not find 'mobility_iBTE' in the output parameters of the convergence run."
+            )
 
-
-    def should_run_final(self):
-        """Check if the final EpwBaseWorkChain should be run."""
-        return self.ctx.is_converged or self.inputs.always_run_final.value
-
-    def run_final_epw_mobility(self):
-        """Run the final EpwBaseWorkChain in mobility mode."""
-        inputs = AttributeDict(self.exposed_inputs(EpwBaseWorkChain, namespace="epw_mobility"))
-
-        # Use the remote folder from the last successful convergence run as the parent
-        parent_folder_epw = self.ctx.epw_interp[-1].outputs.remote_folder
-        inputs.parent_folder_epw = parent_folder_epw
-        inputs.kfpoints = parent_folder_epw.creator.inputs.kfpoints
-        inputs.qfpoints = parent_folder_epw.creator.inputs.qfpoints
-
-        if self.ctx.degaussq:
-            parameters = inputs.parameters.get_dict()
-            parameters.setdefault("INPUTEPW", {})["degaussq"] = self.ctx.degaussq
-            inputs.parameters = orm.Dict(parameters)
-
-        inputs.metadata.call_link_label = "final_mobility_run"
-        running = self.submit(EpwBaseWorkChain, **inputs)
-        self.report(f"Launched final EpwBaseWorkChain<{running.pk}> for mobility calculation.")
-
-        return ToContext(final_epw_mobility=running)
-
-
-    def inspect_final_epw_mobility(self):
-        """Verify that the final EpwBaseWorkChain for mobility finished successfully."""
-        workchain = self.ctx.final_epw_mobility
-
-        if not workchain.is_finished_ok:
-            self.report(f"Final mobility EpwBaseWorkChain<{workchain.pk}> failed with exit status {workchain.exit_status}")
-            return self.exit_codes.ERROR_EPW_INTERPOLATION
-
+        # Check if we ran out of distances without converging
+        if (
+            not self.ctx.is_converged
+            and not self.ctx.interpolation_list
+            and "convergence_threshold" in self.inputs
+        ):
+            return self.exit_codes.ERROR_MOBILITY_NOT_CONVERGED
 
     def results(self):
         """Attach the final results to the outputs."""
         self.report("Workchain finished successfully, attaching final outputs.")
-#        final_results = self.ctx.final_epw_mobility.outputs.output_parameters
- #       self.out("parameters", final_results)
-        # The mobility data is expected to be within the main output parameters Dict
-  #      self.out("carrier_mobility", final_results)
+
+        if self.ctx.epw_interp:
+            final_workchain = self.ctx.epw_interp[-1]
+            self.out("parameters", final_workchain.outputs.output_parameters)
+
+            # Create carrier mobility output Dict using calcfunction for proper provenance
+            carrier_mobility = create_mobility_output(
+                output_parameters=final_workchain.outputs.output_parameters,
+                convergence_history=orm.List(self.ctx.mobility_values),
+                is_converged=orm.Bool(self.ctx.is_converged),
+            )
+            self.out("carrier_mobility", carrier_mobility)
 
     def on_terminated(self):
         """Clean the working directories of all child calculations if `clean_workdir=True` in the inputs."""
