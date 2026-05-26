@@ -21,29 +21,54 @@ default_inputs:
             noinv: False
           CONTROL:
             calculation: bands
-  ph_base:
-    ph:
-      settings:
-        PREPARE_FOR_EPW: True
+  ph_bands:
+    dynamical_matrix:
+      ph_base:
+        ph:
+          settings:
+            PREPARE_FOR_EPW: True
+          parameters:
+            INPUTPH:
+              epsil: True
+    interpolate:
+      q2r:
+        q2r:
+          parameters:
+            INPUT:
+              zasr: simple
+      matdyn:
+        matdyn:
+          parameters:
+            INPUT:
+              asr: simple
+              dos: False
   epw_base:
-    metadata:
-      options:
-        resources:
-          num_machines: 1
-        max_wallclock_seconds: 43200  # Twelve hours
-        withmpi: True
-        stash:
-          source_list:
-            - crystal.fmt
-            - dmedata.fmt
-            - epwdata.fmt
-            - selecq.fmt
-            - vmedata.fmt
-            - aiida.kgmap
-            - aiida.kmap
-            - aiida.ukk
-            - out/aiida.epmatwp
-            - save
+    options:
+      resources:
+        num_machines: 1
+      max_wallclock_seconds: 43200  # Twelve hours
+      withmpi: True
+      stash:
+        source_list:
+          - crystal.fmt
+          - dmedata.fmt
+          - epwdata.fmt
+          - selecq.fmt
+          - vmedata.fmt
+          - wigner.fmt
+          - quadrupole.fmt
+          - restart.fmt
+          - decay.H
+          - decay.v
+          - decay.P
+          - decay.dynmat
+          - decay.epmate
+          - decay.epmatp
+          - aiida.kgmap
+          - aiida.kmap
+          - aiida.ukk
+          - out/aiida.epmatwp
+          - save
     parameters:
       INPUTEPW:
         elph: True
@@ -51,9 +76,10 @@ default_inputs:
         epbwrite: True
         epwread: False
         epwwrite: True
-        fsthick: 100
+        fsthick: 10000
         temps: 300
-        vme: 'dipole'
+        asr_typ: 'simple'
+        vme: 'wannier' #'dipole' or 'wannier'
         wannierize: False
         etf_mem: 1
         lpolar: True
@@ -68,11 +94,13 @@ default_inputs:
       INPUTEPW:
         band_plot: True
         elph: True
+        asr_typ: 'simple'
         epbread: False
         epbwrite: False
         epwread: True
         epwwrite: False
         wannierize: False
+        lpolar: True
 
 
 default_protocol: moderate
